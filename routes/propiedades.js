@@ -307,6 +307,29 @@ const resolverUrlMultimedia = (value) => {
         return raw;
     }
 
+    // Algunos registros entregan el ID de YouTube acompañado del proveedor.
+    // Ejemplo: K11cNaArmkI;youtube
+    const youtubeConProveedor = raw.match(
+        /^([a-zA-Z0-9_-]{11})\s*;\s*youtube$/i
+    );
+
+    if (youtubeConProveedor?.[1]) {
+        return `https://youtu.be/${youtubeConProveedor[1]}`;
+    }
+
+    // Algunos registros entregan solamente el ID de YouTube.
+    // Ejemplo: F78GcjP8chM
+    if (/^[a-zA-Z0-9_-]{11}$/.test(raw)) {
+        return `https://youtu.be/${raw}`;
+    }
+
+    // También soporta enlaces de YouTube o Vimeo sin protocolo.
+    if (
+        /^(?:www\.)?(?:youtube\.com|youtu\.be|vimeo\.com|player\.vimeo\.com)\//i.test(raw)
+    ) {
+        return `https://${raw}`;
+    }
+
     const cleanPath = raw.replace(/^\/+/, '');
 
     // Cuando la API entrega únicamente el nombre del archivo.
