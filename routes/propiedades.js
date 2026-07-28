@@ -236,6 +236,99 @@ const limpiarValor = (value) => {
     return normalized === 'undefined' || normalized === 'null' ? '' : normalized;
 };
 
+// Normaliza el campo de video recibido desde la API de Alaluf.
+// Soporta URL completa, ruta relativa, iframe, objetos y arreglos.
+const resolverUrlMultimedia = (value) => {
+    if (value === undefined || value === null || value === '') {
+        return null;
+    }
+
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const resolved = resolverUrlMultimedia(item);
+            if (resolved) return resolved;
+        }
+
+        return null;
+    }
+
+    if (typeof value === 'object') {
+        const posiblesValores = [
+            value.video_url,
+            value.videoUrl,
+            value.url_video,
+            value.video,
+            value.url,
+            value.src,
+            value.link,
+            value.value
+        ];
+
+        for (const item of posiblesValores) {
+            const resolved = resolverUrlMultimedia(item);
+            if (resolved) return resolved;
+        }
+
+        return null;
+    }
+
+    let raw = limpiarValor(value);
+    if (!raw) return null;
+
+    // Algunos proveedores entregan el reproductor como iframe HTML.
+    const iframeMatch = raw.match(
+        /<iframe[^>]+src=["']([^"']+)["']/i
+    );
+
+    if (iframeMatch?.[1]) {
+        raw = iframeMatch[1].trim();
+    }
+
+    // También acepta un JSON serializado con la URL del video.
+    if (
+        (raw.startsWith('{') && raw.endsWith('}')) ||
+        (raw.startsWith('[') && raw.endsWith(']'))
+    ) {
+        try {
+            const parsed = JSON.parse(raw);
+            return resolverUrlMultimedia(parsed);
+        } catch {
+            // Si no es JSON válido, continúa procesándolo como texto.
+        }
+    }
+
+    // URL protocol-relative: //www.youtube.com/...
+    if (raw.startsWith('//')) {
+        return `https:${raw}`;
+    }
+
+    // URL absoluta: YouTube, Vimeo, MP4, WebM u otro proveedor.
+    if (/^https?:\/\//i.test(raw)) {
+        return raw;
+    }
+
+    const cleanPath = raw.replace(/^\/+/, '');
+
+    // Cuando la API entrega únicamente el nombre del archivo.
+    if (!cleanPath.includes('/')) {
+        return `${SISTEMA_URL_ALALUF}/nuevo/uploads/${cleanPath}`;
+    }
+
+    // Rutas relativas pertenecientes al sistema de Alaluf.
+    if (
+        cleanPath.startsWith('nuevo/') ||
+        cleanPath.startsWith('uploads/')
+    ) {
+        const finalPath = cleanPath.startsWith('uploads/')
+            ? `nuevo/${cleanPath}`
+            : cleanPath;
+
+        return `${SISTEMA_URL_ALALUF}/${finalPath}`;
+    }
+
+    return `${BASE_URL_ALALUF}/${cleanPath}`;
+};
+
 const normalizarTexto = (value) => {
     return limpiarValor(value)
         .normalize('NFD')
@@ -338,6 +431,22 @@ const mapearPropiedad = (prop = {}) => {
         return campo?.value ?? null;
     };
 
+    const videoUrl = resolverUrlMultimedia(
+        prop.video_url ||
+        prop.videoUrl ||
+        prop.url_video ||
+        prop.video ||
+        prop.video_propiedad ||
+        prop.video_internet ||
+        prop.multimedia?.video_url ||
+        prop.multimedia?.videoUrl ||
+        prop.multimedia?.url_video ||
+        prop.multimedia?.video ||
+        extraerCampo('video_url') ||
+        extraerCampo('url video') ||
+        extraerCampo('video')
+    );
+
     return {
         id: prop.id_propiedad,
         codigo:
@@ -410,6 +519,7 @@ const mapearPropiedad = (prop = {}) => {
             descripcion:
                 prop.caracteristicas_internet || prop.observaciones || ''
         },
+        video_url: videoUrl,
         imagenes: imagenesProcesadas
     };
 };
