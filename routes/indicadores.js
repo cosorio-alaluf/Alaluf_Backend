@@ -77,7 +77,7 @@ router.post("/leads", async (req, res) => {
     const response = await fetch("https://alaluf.cl/api/save_lead.php", {
       method: "POST",
       headers: {
-        "X-API-KEY": "cbba09c68a029d2da19c8c160f2ee5825bec7c8e",
+        "X-API-KEY": process.env.ALALUF_API_KEY,
         "Content-Type": "application/json", 
         "User-Agent": "Mozilla/5.0"
       },

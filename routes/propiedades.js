@@ -5,31 +5,55 @@ const https = require('node:https');
 const NodeCache = require('node-cache');
 const { performance } = require('node:perf_hooks');
 
-// Caché fresca: resultados válidos durante 10 minutos.
+// Configuración de caché ajustable por variables de entorno.
+// La frescura lógica es corta, pero el dato anterior se conserva como respaldo
+// para responder sin demoras mientras se reconstruye el catálogo.
+const CATALOG_FRESH_MS = Number(process.env.CATALOG_FRESH_MS || 60_000);
+const CATALOG_CACHE_TTL_SECONDS = Number(
+    process.env.CATALOG_CACHE_TTL_SECONDS || 21_600
+); // 6 horas
+const CATALOG_STALE_TTL_SECONDS = Number(
+    process.env.CATALOG_STALE_TTL_SECONDS || 86_400
+); // 24 horas
+const DETAIL_FRESH_MS = Number(process.env.DETAIL_FRESH_MS || 60_000);
+const DETAIL_CACHE_TTL_SECONDS = Number(
+    process.env.DETAIL_CACHE_TTL_SECONDS || 21_600
+); // 6 horas
+const CACHE_REFRESH_SCAN_MS = Number(
+    process.env.CACHE_REFRESH_SCAN_MS || 15_000
+);
+const ACTIVE_CATALOG_WINDOW_MS = Number(
+    process.env.ACTIVE_CATALOG_WINDOW_MS || 300_000
+); // 5 minutos
+
 const searchCache = new NodeCache({
-    stdTTL: 600,
+    stdTTL: CATALOG_CACHE_TTL_SECONDS,
     checkperiod: 120,
     useClones: false
 });
 
-// Caché de respaldo: permite responder de inmediato mientras se actualiza
-// el catálogo en segundo plano. Evita volver a castigar al usuario después
-// de vencer la caché fresca o ante una caída temporal de Alaluf.
 const staleSearchCache = new NodeCache({
-    stdTTL: 3600,
+    stdTTL: CATALOG_STALE_TTL_SECONDS,
     checkperiod: 300,
     useClones: false
 });
 
 const detailCache = new NodeCache({
-    stdTTL: 1800,
+    stdTTL: DETAIL_CACHE_TTL_SECONDS,
     checkperiod: 120,
     useClones: false
 });
 
-// Evita que solicitudes iguales descarguen el mismo catálogo simultáneamente.
+// Evita descargas duplicadas para la misma búsqueda o detalle.
 const pendingSearches = new Map();
 const pendingDetails = new Map();
+
+// Registra qué catálogos se consultaron recientemente para refrescar solo
+// los que realmente están siendo utilizados.
+const activeCatalogs = new Map();
+
+// Suscriptores SSE opcionales para avisar al frontend cuando un catálogo cambia.
+const cacheEventSubscribers = new Set();
 
 const keepAliveAgent = new https.Agent({
     keepAlive: true,
@@ -367,6 +391,18 @@ const parsePositiveInt = (value, fallback, max = Number.MAX_SAFE_INTEGER) => {
     return Math.min(parsed, max);
 };
 
+// La API externa exige obj=1 (venta) u obj=2 (arriendo) cuando se consulta
+// por tipo de propiedad. También normaliza valores textuales recibidos desde
+// el frontend para impedir que un valor no válido llegue al CRM.
+const normalizarObjetivo = (value) => {
+    const raw = limpiarValor(value).toLowerCase();
+
+    if (['1', 'venta', 'vender', 'sale'].includes(raw)) return '1';
+    if (['2', 'arriendo', 'arrendar', 'renta', 'rent'].includes(raw)) return '2';
+
+    return '';
+};
+
 const crearCacheKey = (prefix, params) => {
     const normalized = Object.entries(params)
         .filter(([, value]) => value !== undefined && value !== null && value !== '')
@@ -375,6 +411,63 @@ const crearCacheKey = (prefix, params) => {
         .join('&');
 
     return `${prefix}|${normalized}`;
+};
+
+
+const obtenerEdadMs = (entry) => {
+    if (!entry?.updatedAt) return Number.POSITIVE_INFINITY;
+    return Math.max(0, Date.now() - entry.updatedAt);
+};
+
+const registrarCatalogoActivo = (cacheKey, catalogQuery) => {
+    activeCatalogs.set(cacheKey, {
+        cacheKey,
+        catalogQuery: { ...catalogQuery },
+        lastAccessAt: Date.now()
+    });
+};
+
+const publicarEventoCache = (event, payload = {}) => {
+    const message = `event: ${event}\ndata: ${JSON.stringify({
+        ...payload,
+        emittedAt: new Date().toISOString()
+    })}\n\n`;
+
+    for (const subscriber of cacheEventSubscribers) {
+        try {
+            subscriber.write(message);
+        } catch {
+            cacheEventSubscribers.delete(subscriber);
+        }
+    }
+};
+
+const normalizarMoneda = (value) => {
+    const normalized = limpiarValor(value)
+        .toUpperCase()
+        .replace(/\s+/g, '')
+        .replace('M²', 'M2');
+
+    if (normalized === '$' || normalized === 'CLP') return 'CLP';
+    if (normalized === 'UF/M2' || normalized === 'UFM2') return 'UF/M2';
+    if (normalized === 'UF') return 'UF';
+    return normalized;
+};
+
+const precioCumpleRango = (precio, monedaSolicitada, minimo, maximo) => {
+    const valor = Number.parseFloat(precio?.valor);
+    if (!Number.isFinite(valor) || valor <= 0) return false;
+
+    if (
+        monedaSolicitada &&
+        normalizarMoneda(precio?.moneda) !== monedaSolicitada
+    ) {
+        return false;
+    }
+
+    if (Number.isFinite(minimo) && valor < minimo) return false;
+    if (Number.isFinite(maximo) && valor > maximo) return false;
+    return true;
 };
 
 const extraerItems = (payload) => {
@@ -554,32 +647,29 @@ const obtenerConsulta = (query) => {
     const offset = (page - 1) * limit;
 
     const tipoProp = limpiarValor(query.tipo_prop || query.tipo);
-    const obj = limpiarValor(query.obj || query.objetivo);
+    const obj = normalizarObjetivo(query.obj || query.objetivo);
     const comunaCodigo = limpiarValor(query.comuna);
     const comunaNombre = limpiarValor(
         query.comuna_nombre ||
         query.comuna_label ||
         COMUNAS_POR_CODIGO[comunaCodigo]
     );
-    const precioMin = limpiarValor(query.precio_min || query.precio_desde);
-    const precioMax = limpiarValor(query.precio_max || query.precio_hasta);
-    const moneda = limpiarValor(query.moneda);
+    const precioMinRaw = limpiarValor(query.precio_min || query.precio_desde);
+    const precioMaxRaw = limpiarValor(query.precio_max || query.precio_hasta);
+    const moneda = normalizarMoneda(query.moneda);
     const destaq = limpiarValor(query.destaq);
 
-    // Solo incluye filtros que cambian el catálogo base. Página, límite,
-    // superficie y orden se procesan localmente para reutilizar la caché.
+    // El CRM de Alaluf necesita la combinación tipo_prop + obj + comuna
+    // para devolver el conjunto correcto. Por eso la comuna forma parte del
+    // snapshot cuando viene informada. Precio, superficie, orden y paginación
+    // continúan procesándose localmente para mantener las búsquedas rápidas.
+    // La operación se agrega al solicitar el snapshot porque la API exige
+    // obj=1 (venta) u obj=2 (arriendo).
     const catalogQuery = {
         tipo_prop: tipoProp
     };
 
-    if (obj) catalogQuery.obj = obj;
-    if (precioMin) catalogQuery.precio_min = precioMin;
-    if (precioMax) catalogQuery.precio_max = precioMax;
-
-    if (moneda && (precioMin || precioMax)) {
-        catalogQuery.moneda = moneda;
-    }
-
+    if (comunaCodigo) catalogQuery.comuna = comunaCodigo;
     if (destaq) catalogQuery.destaq = destaq;
 
     return {
@@ -592,6 +682,9 @@ const obtenerConsulta = (query) => {
         obj,
         comunaCodigo,
         comunaNombre,
+        precioMin: Number.parseFloat(precioMinRaw),
+        precioMax: Number.parseFloat(precioMaxRaw),
+        moneda,
         supDesde: Number.parseFloat(query.sup_desde),
         supHasta: Number.parseFloat(query.sup_hasta)
     };
@@ -713,7 +806,10 @@ const construirCatalogo = async (catalogQuery, cacheKey) => {
     }
 
     const result = {
-        items: catalogo,
+        // Se mapea una sola vez al construir el snapshot para que cada búsqueda
+        // posterior solo filtre, ordene y pagine en memoria.
+        items: catalogo.map(mapearPropiedad),
+        rawItemsCount: catalogo.length,
         apiMs: performance.now() - apiStartedAt,
         peticionesApi,
         catalogoCompleto,
@@ -725,6 +821,12 @@ const construirCatalogo = async (catalogQuery, cacheKey) => {
     if (catalogoCompleto) {
         searchCache.set(cacheKey, result);
         staleSearchCache.set(cacheKey, result);
+
+        publicarEventoCache('catalog-updated', {
+            cacheKey,
+            items: result.items.length,
+            updatedAt: new Date(result.updatedAt).toISOString()
+        });
     }
 
     return result;
@@ -744,26 +846,58 @@ const iniciarActualizacionCatalogo = (catalogQuery, cacheKey) => {
     return requestPromise;
 };
 
-const descargarCatalogoCompleto = async (catalogQuery) => {
+const descargarCatalogoCompleto = async (catalogQuery, options = {}) => {
+    const { forceRefresh = false } = options;
     const cacheKey = crearCacheKey('catalog', catalogQuery);
+    registrarCatalogoActivo(cacheKey, catalogQuery);
+
     const cached = searchCache.get(cacheKey);
 
-    if (cached) {
+    if (cached && !forceRefresh) {
+        const stale = obtenerEdadMs(cached) > CATALOG_FRESH_MS;
+        let refreshing = false;
+
+        if (stale) {
+            refreshing = true;
+            iniciarActualizacionCatalogo(catalogQuery, cacheKey).catch((error) => {
+                console.error(
+                    `No fue posible actualizar ${cacheKey} en segundo plano:`,
+                    error.message
+                );
+            });
+        }
+
         return {
             ...cached,
             cacheHit: true,
-            stale: false
+            stale,
+            refreshing,
+            cacheAgeMs: obtenerEdadMs(cached)
+        };
+    }
+
+    if (forceRefresh) {
+        const freshResult = await iniciarActualizacionCatalogo(
+            catalogQuery,
+            cacheKey
+        );
+
+        return {
+            ...freshResult,
+            cacheHit: Boolean(cached),
+            stale: false,
+            refreshing: false,
+            forcedRefresh: true,
+            cacheAgeMs: 0
         };
     }
 
     const staleCached = staleSearchCache.get(cacheKey);
 
-    // Stale-while-revalidate: se responde inmediatamente con el último
-    // catálogo completo y la actualización ocurre sin bloquear al usuario.
     if (staleCached) {
         iniciarActualizacionCatalogo(catalogQuery, cacheKey).catch((error) => {
             console.error(
-                'No fue posible actualizar el catálogo en segundo plano:',
+                `No fue posible recuperar ${cacheKey} en segundo plano:`,
                 error.message
             );
         });
@@ -772,7 +906,9 @@ const descargarCatalogoCompleto = async (catalogQuery) => {
             ...staleCached,
             cacheHit: true,
             stale: true,
-            refreshing: true
+            refreshing: true,
+            fallbackCache: true,
+            cacheAgeMs: obtenerEdadMs(staleCached)
         };
     }
 
@@ -782,7 +918,8 @@ const descargarCatalogoCompleto = async (catalogQuery) => {
             ...pendingResult,
             cacheHit: true,
             stale: false,
-            sharedRequest: true
+            sharedRequest: true,
+            cacheAgeMs: 0
         };
     }
 
@@ -791,14 +928,291 @@ const descargarCatalogoCompleto = async (catalogQuery) => {
     return {
         ...result,
         cacheHit: false,
-        stale: false
+        stale: false,
+        cacheAgeMs: 0
     };
 };
+
+
+const combinarOperacionTexto = (...values) => {
+    const operaciones = values
+        .flatMap((value) => limpiarValor(value).split('/'))
+        .map((value) => value.trim())
+        .filter(Boolean);
+
+    return [...new Set(operaciones)].join(' / ') || 'Venta / Arriendo';
+};
+
+const combinarPropiedadOperacion = (actual, nueva) => {
+    if (!actual) return nueva;
+
+    const ventaActual = actual.precios?.venta;
+    const ventaNueva = nueva.precios?.venta;
+    const arriendoActual = actual.precios?.arriendo;
+    const arriendoNuevo = nueva.precios?.arriendo;
+
+    return {
+        ...actual,
+        operacion: combinarOperacionTexto(actual.operacion, nueva.operacion),
+        precios: {
+            ...actual.precios,
+            ...nueva.precios,
+            venta:
+                Number.parseFloat(ventaNueva?.valor || 0) > 0
+                    ? ventaNueva
+                    : ventaActual,
+            arriendo:
+                Number.parseFloat(arriendoNuevo?.valor || 0) > 0
+                    ? arriendoNuevo
+                    : arriendoActual
+        },
+        imagenes:
+            Array.isArray(nueva.imagenes) &&
+            nueva.imagenes.length > (actual.imagenes?.length || 0)
+                ? nueva.imagenes
+                : actual.imagenes,
+        video_url: actual.video_url || nueva.video_url,
+        ubicacion: {
+            ...nueva.ubicacion,
+            ...actual.ubicacion
+        },
+        detalles: {
+            ...nueva.detalles,
+            ...actual.detalles
+        }
+    };
+};
+
+const combinarResultadosCatalogo = (results) => {
+    const propiedadesPorId = new Map();
+
+    for (const result of results) {
+        for (const item of result.items || []) {
+            const key = limpiarValor(item.id || item.codigo);
+
+            if (!key) {
+                propiedadesPorId.set(
+                    `sin-id:${propiedadesPorId.size}`,
+                    item
+                );
+                continue;
+            }
+
+            propiedadesPorId.set(
+                key,
+                combinarPropiedadOperacion(propiedadesPorId.get(key), item)
+            );
+        }
+    }
+
+    const updatedTimes = results
+        .map((result) => Number(result.updatedAt || 0))
+        .filter((value) => value > 0);
+
+    return {
+        items: [...propiedadesPorId.values()],
+        rawItemsCount: results.reduce(
+            (total, result) => total + Number(result.rawItemsCount || 0),
+            0
+        ),
+        apiMs: results.reduce(
+            (total, result) => total + Number(result.apiMs || 0),
+            0
+        ),
+        peticionesApi: results.reduce(
+            (total, result) => total + Number(result.peticionesApi || 0),
+            0
+        ),
+        catalogoCompleto: results.every(
+            (result) => result.catalogoCompleto !== false
+        ),
+        updatedAt: updatedTimes.length
+            ? Math.min(...updatedTimes)
+            : Date.now(),
+        cacheHit: results.every((result) => Boolean(result.cacheHit)),
+        stale: results.some((result) => Boolean(result.stale)),
+        refreshing: results.some((result) => Boolean(result.refreshing)),
+        fallbackCache: results.some(
+            (result) => Boolean(result.fallbackCache)
+        ),
+        sharedRequest: results.some(
+            (result) => Boolean(result.sharedRequest)
+        ),
+        cacheAgeMs: Math.max(
+            0,
+            ...results.map((result) => Number(result.cacheAgeMs || 0))
+        ),
+        catalogKeys: results.map((result) => result.cacheKey).filter(Boolean)
+    };
+};
+
+// La API de Alaluf no acepta búsquedas por tipo sin obj. Cuando el frontend
+// no especifica operación, se descargan/leen en paralelo los snapshots de
+// venta y arriendo, ambos cacheados, y luego se combinan en memoria.
+const descargarCatalogosPorObjetivo = async (
+    catalogQuery,
+    obj,
+    options = {}
+) => {
+    const objetivoNormalizado = normalizarObjetivo(obj);
+    const objetivos = objetivoNormalizado
+        ? [objetivoNormalizado]
+        : ['1', '2'];
+
+    const settled = await Promise.allSettled(
+        objetivos.map(async (objetivo) => {
+            const queryPorObjetivo = {
+                ...catalogQuery,
+                obj: objetivo
+            };
+
+            const result = await descargarCatalogoCompleto(
+                queryPorObjetivo,
+                options
+            );
+
+            return {
+                ...result,
+                cacheKey: crearCacheKey('catalog', queryPorObjetivo),
+                objetivo
+            };
+        })
+    );
+
+    const fulfilled = settled
+        .filter((result) => result.status === 'fulfilled')
+        .map((result) => result.value);
+
+    const rejected = settled.filter(
+        (result) => result.status === 'rejected'
+    );
+
+    for (const failure of rejected) {
+        console.error(
+            'No fue posible cargar uno de los objetivos del catálogo:',
+            failure.reason?.message || failure.reason
+        );
+    }
+
+    if (fulfilled.length === 0) {
+        throw rejected[0]?.reason || new Error(
+            'No fue posible cargar el catálogo de venta ni arriendo.'
+        );
+    }
+
+    return combinarResultadosCatalogo(fulfilled);
+};
+
+const marcarCatalogosComoDesactualizados = (tipoProp = '') => {
+    const tipoNormalizado = limpiarValor(tipoProp).toLowerCase();
+    let marcados = 0;
+
+    for (const cacheKey of searchCache.keys()) {
+        if (
+            tipoNormalizado &&
+            !cacheKey.includes(`tipo_prop=${tipoNormalizado}`)
+        ) {
+            continue;
+        }
+
+        const entry = searchCache.get(cacheKey);
+        if (!entry) continue;
+
+        const staleEntry = { ...entry, updatedAt: 0 };
+        searchCache.set(cacheKey, staleEntry);
+        staleSearchCache.set(cacheKey, staleEntry);
+        marcados += 1;
+    }
+
+    return marcados;
+};
+
+const refrescarCatalogosActivos = async ({ force = false } = {}) => {
+    const now = Date.now();
+    const jobs = [];
+
+    for (const [cacheKey, activity] of activeCatalogs.entries()) {
+        if (now - activity.lastAccessAt > ACTIVE_CATALOG_WINDOW_MS) {
+            activeCatalogs.delete(cacheKey);
+            continue;
+        }
+
+        const cached = searchCache.get(cacheKey);
+        const needsRefresh =
+            force || !cached || obtenerEdadMs(cached) > CATALOG_FRESH_MS;
+
+        if (!needsRefresh || pendingSearches.has(cacheKey)) continue;
+
+        // Se ejecuta secuencialmente para evitar golpear al CRM con varias
+        // categorías completas al mismo tiempo.
+        jobs.push(async () => {
+            try {
+                await iniciarActualizacionCatalogo(
+                    activity.catalogQuery,
+                    cacheKey
+                );
+            } catch (error) {
+                console.error(
+                    `Refresco automático falló para ${cacheKey}:`,
+                    error.message
+                );
+            }
+        });
+    }
+
+    for (const job of jobs) {
+        await job();
+    }
+
+    return jobs.length;
+};
+
+const refreshTimer = setInterval(() => {
+    refrescarCatalogosActivos().catch((error) => {
+        console.error('Error en mantenimiento de caché:', error.message);
+    });
+}, CACHE_REFRESH_SCAN_MS);
+
+// Permite que Node finalice normalmente durante pruebas o despliegues.
+refreshTimer.unref?.();
 
 const obtenerPrecioComparable = (item) => {
     const venta = Number.parseFloat(item.precios?.venta?.valor || 0);
     const arriendo = Number.parseFloat(item.precios?.arriendo?.valor || 0);
     return Math.max(venta, arriendo);
+};
+
+const filtrarPorOperacionYPrecio = (
+    propiedades,
+    { obj, precioMin, precioMax, moneda }
+) => {
+    const tieneRango = Number.isFinite(precioMin) || Number.isFinite(precioMax);
+
+    return propiedades.filter((item) => {
+        const venta = item.precios?.venta;
+        const arriendo = item.precios?.arriendo;
+
+        if (obj === '1') {
+            return tieneRango
+                ? precioCumpleRango(venta, moneda, precioMin, precioMax)
+                : Number.parseFloat(venta?.valor || 0) > 0;
+        }
+
+        if (obj === '2') {
+            return tieneRango
+                ? precioCumpleRango(arriendo, moneda, precioMin, precioMax)
+                : Number.parseFloat(arriendo?.valor || 0) > 0;
+        }
+
+        if (tieneRango || moneda) {
+            return (
+                precioCumpleRango(venta, moneda, precioMin, precioMax) ||
+                precioCumpleRango(arriendo, moneda, precioMin, precioMax)
+            );
+        }
+
+        return true;
+    });
 };
 
 const ordenarPropiedades = (propiedades, orden, dir) => {
@@ -845,6 +1259,9 @@ router.get('/buscar', async (req, res) => {
             obj,
             comunaCodigo,
             comunaNombre,
+            precioMin,
+            precioMax,
+            moneda,
             supDesde,
             supHasta
         } = obtenerConsulta(req.query);
@@ -855,21 +1272,22 @@ router.get('/buscar', async (req, res) => {
             });
         }
 
-        const searchResult = await descargarCatalogoCompleto(catalogQuery);
+        const searchResult = await descargarCatalogosPorObjetivo(
+            catalogQuery,
+            obj
+        );
 
         const processingStartedAt = performance.now();
-        let propiedades = searchResult.items.map(mapearPropiedad);
+        let propiedades = [...searchResult.items];
 
-        // Refuerzo de operación por compatibilidad con resultados mixtos.
-        if (obj === '1') {
-            propiedades = propiedades.filter(
-                (item) => Number.parseFloat(item.precios?.venta?.valor || 0) > 0
-            );
-        } else if (obj === '2') {
-            propiedades = propiedades.filter(
-                (item) => Number.parseFloat(item.precios?.arriendo?.valor || 0) > 0
-            );
-        }
+        // Operación, precio y moneda se filtran en memoria sobre el snapshot
+        // base para evitar reconstruir catálogos equivalentes.
+        propiedades = filtrarPorOperacionYPrecio(propiedades, {
+            obj,
+            precioMin,
+            precioMax,
+            moneda
+        });
 
         // La API externa puede ignorar el filtro comuna. Por eso se aplica
         // nuevamente en Node sobre el catálogo base, usando primero el código
@@ -958,7 +1376,14 @@ router.get('/buscar', async (req, res) => {
                 peticionesApi: searchResult.peticionesApi || 0,
                 catalogoCompleto: searchResult.catalogoCompleto !== false,
                 cacheStale: Boolean(searchResult.stale),
-                actualizandoCache: Boolean(searchResult.refreshing)
+                actualizandoCache: Boolean(searchResult.refreshing),
+                cacheAgeSeconds: Math.round(
+                    (searchResult.cacheAgeMs || 0) / 1000
+                ),
+                cacheUpdatedAt: searchResult.updatedAt
+                    ? new Date(searchResult.updatedAt).toISOString()
+                    : null,
+                cacheFreshSeconds: Math.round(CATALOG_FRESH_MS / 1000)
             }
         });
     } catch (error) {
@@ -983,44 +1408,59 @@ router.get('/buscar', async (req, res) => {
     }
 });
 
-const consultarDetallePorId = async (idPropiedad) => {
-    const cacheKey = `detail:id:${idPropiedad}`;
-    const cached = detailCache.get(cacheKey);
+const guardarDetalleEnCache = (propiedad, additionalKeys = []) => {
+    if (!propiedad) return;
 
-    if (cached) {
-        return {
-            propiedad: cached,
-            cacheHit: true
-        };
+    const entry = {
+        propiedad,
+        updatedAt: Date.now()
+    };
+
+    const keys = new Set(additionalKeys.filter(Boolean));
+
+    if (propiedad.id) keys.add(`detail:id:${propiedad.id}`);
+    if (propiedad.codigo) keys.add(`detail:code:${propiedad.codigo}`);
+
+    for (const key of keys) {
+        detailCache.set(key, entry);
     }
 
+    publicarEventoCache('property-updated', {
+        id: propiedad.id || null,
+        codigo: propiedad.codigo || null,
+        updatedAt: new Date(entry.updatedAt).toISOString()
+    });
+};
+
+const solicitarDetallePorId = async (idPropiedad) => {
+    const response = await alalufAxios.get(
+        `${BASE_URL_ALALUF}/api/propiedad.php`,
+        {
+            params: {
+                id_propiedad: idPropiedad
+            }
+        }
+    );
+
+    if (response.status >= 400 || !response.data?.data) {
+        return null;
+    }
+
+    return mapearPropiedad(response.data.data);
+};
+
+const iniciarActualizacionDetallePorId = (idPropiedad) => {
+    const cacheKey = `detail:id:${idPropiedad}`;
+
     if (pendingDetails.has(cacheKey)) {
-        return {
-            propiedad: await pendingDetails.get(cacheKey),
-            cacheHit: true,
-            sharedRequest: true
-        };
+        return pendingDetails.get(cacheKey);
     }
 
     const requestPromise = (async () => {
-        const response = await alalufAxios.get(
-            `${BASE_URL_ALALUF}/api/propiedad.php`,
-            {
-                params: {
-                    id_propiedad: idPropiedad
-                }
-            }
-        );
+        const propiedad = await solicitarDetallePorId(idPropiedad);
 
-        if (response.status >= 400 || !response.data?.data) {
-            return null;
-        }
-
-        const propiedad = mapearPropiedad(response.data.data);
-        detailCache.set(cacheKey, propiedad);
-
-        if (propiedad.codigo) {
-            detailCache.set(`detail:code:${propiedad.codigo}`, propiedad);
+        if (propiedad) {
+            guardarDetalleEnCache(propiedad, [cacheKey]);
         }
 
         return propiedad;
@@ -1029,41 +1469,67 @@ const consultarDetallePorId = async (idPropiedad) => {
     });
 
     pendingDetails.set(cacheKey, requestPromise);
-    const propiedad = await requestPromise;
+    return requestPromise;
+};
+
+const consultarDetallePorId = async (
+    idPropiedad,
+    { forceRefresh = false } = {}
+) => {
+    const cacheKey = `detail:id:${idPropiedad}`;
+    const cached = detailCache.get(cacheKey);
+
+    if (cached && !forceRefresh) {
+        const stale = obtenerEdadMs(cached) > DETAIL_FRESH_MS;
+
+        if (stale) {
+            iniciarActualizacionDetallePorId(idPropiedad).catch((error) => {
+                console.error(
+                    `No fue posible refrescar detalle ${idPropiedad}:`,
+                    error.message
+                );
+            });
+        }
+
+        return {
+            propiedad: cached.propiedad,
+            cacheHit: true,
+            stale,
+            refreshing: stale,
+            cacheAgeMs: obtenerEdadMs(cached),
+            updatedAt: cached.updatedAt
+        };
+    }
+
+    if (pendingDetails.has(cacheKey)) {
+        return {
+            propiedad: await pendingDetails.get(cacheKey),
+            cacheHit: Boolean(cached),
+            sharedRequest: true,
+            stale: false,
+            cacheAgeMs: 0
+        };
+    }
+
+    const propiedad = await iniciarActualizacionDetallePorId(idPropiedad);
 
     return {
         propiedad,
-        cacheHit: false
+        cacheHit: Boolean(cached),
+        stale: false,
+        cacheAgeMs: 0,
+        updatedAt: Date.now()
     };
 };
 
-// Búsqueda por código comercial.
-router.get('/codigo/:codigo', async (req, res) => {
-    const codigo = limpiarValor(req.params.codigo);
-    const totalStartedAt = performance.now();
+const iniciarActualizacionDetallePorCodigo = (codigo) => {
+    const pendingKey = `detail:lookup:${codigo}`;
 
-    if (!codigo) {
-        return res.status(400).json({
-            error: 'Código inválido.'
-        });
+    if (pendingDetails.has(pendingKey)) {
+        return pendingDetails.get(pendingKey);
     }
 
-    const codeCacheKey = `detail:code:${codigo}`;
-    const cached = detailCache.get(codeCacheKey);
-
-    if (cached) {
-        return res.json({
-            ...cached,
-            meta: {
-                cache: true,
-                tiempoTotalMs: Math.round(
-                    performance.now() - totalStartedAt
-                )
-            }
-        });
-    }
-
-    try {
+    const requestPromise = (async () => {
         const searchResponse = await alalufAxios.get(
             `${BASE_URL_ALALUF}/api/res.php`,
             {
@@ -1085,21 +1551,225 @@ router.get('/codigo/:codigo', async (req, res) => {
         });
 
         const idPropiedad = match?.id_propiedad || codigo;
-        const detailResult = await consultarDetallePorId(idPropiedad);
+        const propiedad = await iniciarActualizacionDetallePorId(idPropiedad);
 
-        if (!detailResult.propiedad) {
+        if (propiedad) {
+            guardarDetalleEnCache(propiedad, [`detail:code:${codigo}`]);
+        }
+
+        return propiedad;
+    })().finally(() => {
+        pendingDetails.delete(pendingKey);
+    });
+
+    pendingDetails.set(pendingKey, requestPromise);
+    return requestPromise;
+};
+
+const verificarAdminCache = (req, res, next) => {
+    const configuredToken = limpiarValor(process.env.CACHE_ADMIN_TOKEN);
+
+    if (!configuredToken) {
+        return res.status(503).json({
+            error: 'CACHE_ADMIN_TOKEN no está configurado.'
+        });
+    }
+
+    const suppliedToken = limpiarValor(
+        req.get('x-cache-admin-token') ||
+        req.get('authorization')?.replace(/^Bearer\s+/i, '')
+    );
+
+    if (suppliedToken !== configuredToken) {
+        return res.status(401).json({
+            error: 'No autorizado.'
+        });
+    }
+
+    return next();
+};
+
+// Eventos ligeros para que el frontend pueda enterarse de refrescos sin usar
+// Socket.IO. Se puede consumir con EventSource desde el navegador.
+router.get('/cache/events', (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    res.write(`event: connected\ndata: ${JSON.stringify({
+        connectedAt: new Date().toISOString()
+    })}\n\n`);
+
+    cacheEventSubscribers.add(res);
+
+    const keepAlive = setInterval(() => {
+        res.write(': keep-alive\n\n');
+    }, 25_000);
+
+    req.on('close', () => {
+        clearInterval(keepAlive);
+        cacheEventSubscribers.delete(res);
+    });
+});
+
+router.get('/cache/status', verificarAdminCache, (req, res) => {
+    const now = Date.now();
+
+    const catalogs = searchCache.keys().map((cacheKey) => {
+        const entry = searchCache.get(cacheKey);
+        const activity = activeCatalogs.get(cacheKey);
+
+        return {
+            cacheKey,
+            items: entry?.items?.length || 0,
+            updatedAt: entry?.updatedAt
+                ? new Date(entry.updatedAt).toISOString()
+                : null,
+            ageSeconds: entry?.updatedAt
+                ? Math.round((now - entry.updatedAt) / 1000)
+                : null,
+            fresh: entry
+                ? obtenerEdadMs(entry) <= CATALOG_FRESH_MS
+                : false,
+            refreshing: pendingSearches.has(cacheKey),
+            active: Boolean(
+                activity &&
+                now - activity.lastAccessAt <= ACTIVE_CATALOG_WINDOW_MS
+            ),
+            lastAccessAt: activity?.lastAccessAt
+                ? new Date(activity.lastAccessAt).toISOString()
+                : null
+        };
+    });
+
+    return res.json({
+        configuration: {
+            catalogFreshSeconds: Math.round(CATALOG_FRESH_MS / 1000),
+            detailFreshSeconds: Math.round(DETAIL_FRESH_MS / 1000),
+            refreshScanSeconds: Math.round(CACHE_REFRESH_SCAN_MS / 1000),
+            activeWindowSeconds: Math.round(
+                ACTIVE_CATALOG_WINDOW_MS / 1000
+            )
+        },
+        catalogs,
+        pendingCatalogRefreshes: pendingSearches.size,
+        detailEntries: detailCache.keys().length,
+        pendingDetailRefreshes: pendingDetails.size,
+        subscribers: cacheEventSubscribers.size
+    });
+});
+
+router.post('/cache/refresh', verificarAdminCache, async (req, res) => {
+    const tipoProp = limpiarValor(req.body?.tipo_prop || req.query?.tipo_prop);
+    const obj = normalizarObjetivo(req.body?.obj || req.query?.obj);
+    const comuna = limpiarValor(req.body?.comuna || req.query?.comuna);
+    const destaq = limpiarValor(req.body?.destaq || req.query?.destaq);
+
+    if (tipoProp) {
+        const catalogQuery = { tipo_prop: tipoProp };
+        if (comuna) catalogQuery.comuna = comuna;
+        if (destaq) catalogQuery.destaq = destaq;
+
+        try {
+            const result = await descargarCatalogosPorObjetivo(
+                catalogQuery,
+                obj,
+                { forceRefresh: true }
+            );
+
+            return res.json({
+                success: true,
+                refreshed: obj ? 1 : 2,
+                catalogKeys: result.catalogKeys,
+                items: result.items.length,
+                updatedAt: new Date(result.updatedAt).toISOString()
+            });
+        } catch (error) {
+            return res.status(502).json({
+                success: false,
+                error: error.message
+            });
+        }
+    }
+
+    const refreshed = await refrescarCatalogosActivos({ force: true });
+
+    return res.json({
+        success: true,
+        refreshed
+    });
+});
+
+router.post('/cache/clear', verificarAdminCache, (req, res) => {
+    searchCache.flushAll();
+    staleSearchCache.flushAll();
+    detailCache.flushAll();
+    activeCatalogs.clear();
+
+    return res.json({
+        success: true,
+        message: 'Caché eliminada.'
+    });
+});
+
+// Búsqueda por código comercial.
+router.get('/codigo/:codigo', async (req, res) => {
+    const codigo = limpiarValor(req.params.codigo);
+    const totalStartedAt = performance.now();
+
+    if (!codigo) {
+        return res.status(400).json({
+            error: 'Código inválido.'
+        });
+    }
+
+    const codeCacheKey = `detail:code:${codigo}`;
+    const cached = detailCache.get(codeCacheKey);
+
+    if (cached) {
+        const stale = obtenerEdadMs(cached) > DETAIL_FRESH_MS;
+
+        if (stale) {
+            iniciarActualizacionDetallePorCodigo(codigo).catch((error) => {
+                console.error(
+                    `No fue posible refrescar código ${codigo}:`,
+                    error.message
+                );
+            });
+        }
+
+        return res.json({
+            ...cached.propiedad,
+            meta: {
+                cache: true,
+                cacheStale: stale,
+                actualizandoCache: stale,
+                cacheAgeSeconds: Math.round(obtenerEdadMs(cached) / 1000),
+                cacheUpdatedAt: new Date(cached.updatedAt).toISOString(),
+                tiempoTotalMs: Math.round(
+                    performance.now() - totalStartedAt
+                )
+            }
+        });
+    }
+
+    try {
+        const propiedad = await iniciarActualizacionDetallePorCodigo(codigo);
+
+        if (!propiedad) {
             return res.status(404).json({
                 error: 'Propiedad no encontrada.'
             });
         }
 
-        detailCache.set(codeCacheKey, detailResult.propiedad);
-
         return res.json({
-            ...detailResult.propiedad,
+            ...propiedad,
             meta: {
-                cache: detailResult.cacheHit,
-                solicitudCompartida: Boolean(detailResult.sharedRequest),
+                cache: false,
+                cacheStale: false,
+                actualizandoCache: false,
+                cacheAgeSeconds: 0,
                 tiempoTotalMs: Math.round(
                     performance.now() - totalStartedAt
                 )
@@ -1130,6 +1800,19 @@ router.get('/:id', async (req, res) => {
             });
         }
 
+        res.setHeader(
+            'X-Cache-Source',
+            detailResult.cacheHit
+                ? detailResult.stale
+                    ? 'stale-cache'
+                    : 'fresh-cache'
+                : 'api'
+        );
+        res.setHeader(
+            'X-Cache-Updating',
+            String(Boolean(detailResult.refreshing))
+        );
+
         return res.json(detailResult.propiedad);
     } catch (error) {
         console.error(
@@ -1142,5 +1825,33 @@ router.get('/:id', async (req, res) => {
         });
     }
 });
+
+const cacheService = {
+    marcarCatalogosComoDesactualizados,
+    refrescarCatalogosActivos,
+    invalidateAllDetails: () => detailCache.flushAll(),
+    invalidateDetail: (value) => {
+        const normalized = limpiarValor(value);
+        if (!normalized) return 0;
+
+        let deleted = 0;
+        for (const key of [
+            `detail:id:${normalized}`,
+            `detail:code:${normalized}`,
+            `detail:lookup:${normalized}`
+        ]) {
+            if (detailCache.del(key)) deleted += 1;
+        }
+        return deleted;
+    },
+    getStatus: () => ({
+        catalogs: searchCache.keys().length,
+        details: detailCache.keys().length,
+        pendingCatalogs: pendingSearches.size,
+        pendingDetails: pendingDetails.size
+    })
+};
+
+router.cacheService = cacheService;
 
 module.exports = router;
