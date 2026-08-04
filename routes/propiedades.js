@@ -78,10 +78,6 @@ const alalufAxios = axios.create({
 const BASE_URL_ALALUF = 'https://alaluf.cl';
 const SISTEMA_URL_ALALUF = 'https://sistema.alaluf.com';
 
-// Versión lógica del catálogo. Evita reutilizar snapshots creados con una
-// estructura anterior donde los precios definían la operación.
-const CATALOG_CACHE_SCHEMA = 'desc-obj-v3-objetivo-3';
-
 const COMUNAS_POR_CODIGO = Object.freeze({
     '1101': 'Iquique',
     '1211': 'Alto Hospicio',
@@ -395,86 +391,16 @@ const parsePositiveInt = (value, fallback, max = Number.MAX_SAFE_INTEGER) => {
     return Math.min(parsed, max);
 };
 
-// Valores admitidos por la API de Alaluf:
-// obj=1 -> Venta
-// obj=2 -> Arriendo
-// obj=3 -> Venta o Arriendo
+// La API externa exige obj=1 (venta) u obj=2 (arriendo) cuando se consulta
+// por tipo de propiedad. También normaliza valores textuales recibidos desde
+// el frontend para impedir que un valor no válido llegue al CRM.
 const normalizarObjetivo = (value) => {
-    const raw = normalizarTexto(value);
+    const raw = limpiarValor(value).toLowerCase();
 
-    if (
-        ['1', 'venta', 'vender', 'sale'].includes(raw)
-    ) {
-        return '1';
-    }
-
-    if (
-        [
-            '2',
-            'arriendo',
-            'arrendar',
-            'renta',
-            'rent'
-        ].includes(raw)
-    ) {
-        return '2';
-    }
-
-    if (
-        [
-            '3',
-            'venta o arriendo',
-            'venta y arriendo',
-            'venta / arriendo',
-            'venta/arriendo',
-            'ambas',
-            'ambos',
-            'todos',
-            'todas'
-        ].includes(raw)
-    ) {
-        return '3';
-    }
+    if (['1', 'venta', 'vender', 'sale'].includes(raw)) return '1';
+    if (['2', 'arriendo', 'arrendar', 'renta', 'rent'].includes(raw)) return '2';
 
     return '';
-};
-
-// desc_obj es el campo mandante para determinar si una propiedad pertenece
-// a Venta, Arriendo o a ambas operaciones.
-const obtenerEstadoOperacion = (value) => {
-    const original = limpiarValor(value);
-    const normalizada = normalizarTexto(original);
-
-    return {
-        original,
-        normalizada,
-        permiteVenta: normalizada.includes('venta'),
-        permiteArriendo: normalizada.includes('arriendo')
-    };
-};
-
-const operacionCoincide = (descObj, objetivo) => {
-    const objetivoNormalizado =
-        normalizarObjetivo(objetivo);
-
-    if (!objetivoNormalizado) return true;
-
-    const estado =
-        obtenerEstadoOperacion(descObj);
-
-    if (objetivoNormalizado === '1') {
-        return estado.permiteVenta;
-    }
-
-    if (objetivoNormalizado === '2') {
-        return estado.permiteArriendo;
-    }
-
-    // obj=3 corresponde a Venta o Arriendo.
-    return (
-        estado.permiteVenta ||
-        estado.permiteArriendo
-    );
 };
 
 const crearCacheKey = (prefix, params) => {
@@ -614,9 +540,7 @@ const mapearPropiedad = (prop = {}) => {
         const campo = prop.campos_especificos.find((item) => {
             return (
                 typeof item?.label === 'string' &&
-                normalizarTexto(item.label).includes(
-                    normalizarTexto(labelDeseado)
-                )
+                item.label.toLowerCase().includes(labelDeseado.toLowerCase())
             );
         });
 
@@ -639,23 +563,6 @@ const mapearPropiedad = (prop = {}) => {
         extraerCampo('video')
     );
 
-    const descObjOriginal = limpiarValor(
-        prop.desc_obj ||
-        prop.operacion ||
-        prop.objetivo
-    );
-
-    const estadoOperacion = obtenerEstadoOperacion(descObjOriginal);
-
-    const valorVentaRaw = limpiarValor(prop.valor_venta);
-    const valorArriendoRaw = limpiarValor(prop.valor_arriendo);
-
-    const tieneValorVenta =
-        Number.parseFloat(valorVentaRaw || 0) > 0;
-
-    const tieneValorArriendo =
-        Number.parseFloat(valorArriendoRaw || 0) > 0;
-
     return {
         id: prop.id_propiedad,
         codigo:
@@ -663,11 +570,7 @@ const mapearPropiedad = (prop = {}) => {
             prop.codigo_interno ||
             prop.id_propiedad,
         titulo: prop.desc_tipo_prop || prop.desc_tipo || 'Propiedad',
-
-        // Se conserva el valor original entregado por el CRM.
-        desc_obj: descObjOriginal || null,
-        operacion: descObjOriginal || 'Sin operación',
-
+        operacion: prop.desc_obj || 'Venta / Arriendo',
         ubicacion: {
             comuna: prop.com_nombre || prop.comuna || 'Sin Comuna',
             codigoComuna: limpiarValor(
@@ -687,33 +590,20 @@ const mapearPropiedad = (prop = {}) => {
             lat: Number.isFinite(lat) && lat !== 0 ? lat : null,
             lng: Number.isFinite(lng) && lng !== 0 ? lng : null
         },
-
-        /*
-         * Los precios no determinan la operación.
-         * Solo se exponen cuando desc_obj permite esa operación.
-         */
         precios: {
             venta: {
                 valor:
-                    estadoOperacion.permiteVenta &&
-                    tieneValorVenta
-                        ? valorVentaRaw
+                    prop.valor_venta && prop.valor_venta !== '0'
+                        ? prop.valor_venta
                         : null,
-                moneda:
-                    estadoOperacion.permiteVenta
-                        ? prop.moneda_venta || 'UF'
-                        : null
+                moneda: prop.moneda_venta || 'UF'
             },
             arriendo: {
                 valor:
-                    estadoOperacion.permiteArriendo &&
-                    tieneValorArriendo
-                        ? valorArriendoRaw
+                    prop.valor_arriendo && prop.valor_arriendo !== '0'
+                        ? prop.valor_arriendo
                         : null,
-                moneda:
-                    estadoOperacion.permiteArriendo
-                        ? prop.moneda_arriendo || 'UF/m2'
-                        : null
+                moneda: prop.moneda_arriendo || 'UF/m2'
             }
         },
         detalles: {
@@ -958,7 +848,7 @@ const iniciarActualizacionCatalogo = (catalogQuery, cacheKey) => {
 
 const descargarCatalogoCompleto = async (catalogQuery, options = {}) => {
     const { forceRefresh = false } = options;
-    const cacheKey = crearCacheKey(`catalog:${CATALOG_CACHE_SCHEMA}`, catalogQuery);
+    const cacheKey = crearCacheKey('catalog', catalogQuery);
     registrarCatalogoActivo(cacheKey, catalogQuery);
 
     const cached = searchCache.get(cacheKey);
@@ -1044,127 +934,51 @@ const descargarCatalogoCompleto = async (catalogQuery, options = {}) => {
 };
 
 
-const seleccionarOperacionMandante = (actual, nueva) => {
-    const operacionActual = limpiarValor(
-        actual?.desc_obj ||
-        actual?.operacion
-    );
+const combinarOperacionTexto = (...values) => {
+    const operaciones = values
+        .flatMap((value) => limpiarValor(value).split('/'))
+        .map((value) => value.trim())
+        .filter(Boolean);
 
-    const operacionNueva = limpiarValor(
-        nueva?.desc_obj ||
-        nueva?.operacion
-    );
-
-    if (!operacionActual) return operacionNueva;
-    if (!operacionNueva) return operacionActual;
-
-    const estadoActual = obtenerEstadoOperacion(operacionActual);
-    const estadoNuevo = obtenerEstadoOperacion(operacionNueva);
-
-    if (estadoActual.normalizada === estadoNuevo.normalizada) {
-        return operacionNueva;
-    }
-
-    /*
-     * Si uno de los snapshots informa una operación única y el otro una
-     * operación doble, se prefiere la operación única para no conservar
-     * un estado anterior de Venta / Arriendo.
-     */
-    const actualEsDoble =
-        estadoActual.permiteVenta &&
-        estadoActual.permiteArriendo;
-
-    const nuevaEsDoble =
-        estadoNuevo.permiteVenta &&
-        estadoNuevo.permiteArriendo;
-
-    if (actualEsDoble && !nuevaEsDoble) {
-        return operacionNueva;
-    }
-
-    if (!actualEsDoble && nuevaEsDoble) {
-        return operacionActual;
-    }
-
-    // Si ambos valores son válidos pero distintos, se utiliza el snapshot
-    // procesado más recientemente sin inventar una operación combinada.
-    return operacionNueva;
+    return [...new Set(operaciones)].join(' / ') || 'Venta / Arriendo';
 };
 
 const combinarPropiedadOperacion = (actual, nueva) => {
     if (!actual) return nueva;
-
-    const operacionMandante =
-        seleccionarOperacionMandante(actual, nueva);
-
-    const estadoOperacion =
-        obtenerEstadoOperacion(operacionMandante);
 
     const ventaActual = actual.precios?.venta;
     const ventaNueva = nueva.precios?.venta;
     const arriendoActual = actual.precios?.arriendo;
     const arriendoNuevo = nueva.precios?.arriendo;
 
-    const ventaSeleccionada =
-        Number.parseFloat(ventaNueva?.valor || 0) > 0
-            ? ventaNueva
-            : ventaActual;
-
-    const arriendoSeleccionado =
-        Number.parseFloat(arriendoNuevo?.valor || 0) > 0
-            ? arriendoNuevo
-            : arriendoActual;
-
     return {
         ...actual,
-        ...nueva,
-
-        desc_obj: operacionMandante || null,
-        operacion: operacionMandante || 'Sin operación',
-
+        operacion: combinarOperacionTexto(actual.operacion, nueva.operacion),
         precios: {
-            venta: {
-                valor:
-                    estadoOperacion.permiteVenta &&
-                    Number.parseFloat(ventaSeleccionada?.valor || 0) > 0
-                        ? ventaSeleccionada.valor
-                        : null,
-                moneda:
-                    estadoOperacion.permiteVenta
-                        ? ventaSeleccionada?.moneda || null
-                        : null
-            },
-            arriendo: {
-                valor:
-                    estadoOperacion.permiteArriendo &&
-                    Number.parseFloat(arriendoSeleccionado?.valor || 0) > 0
-                        ? arriendoSeleccionado.valor
-                        : null,
-                moneda:
-                    estadoOperacion.permiteArriendo
-                        ? arriendoSeleccionado?.moneda || null
-                        : null
-            }
+            ...actual.precios,
+            ...nueva.precios,
+            venta:
+                Number.parseFloat(ventaNueva?.valor || 0) > 0
+                    ? ventaNueva
+                    : ventaActual,
+            arriendo:
+                Number.parseFloat(arriendoNuevo?.valor || 0) > 0
+                    ? arriendoNuevo
+                    : arriendoActual
         },
-
         imagenes:
             Array.isArray(nueva.imagenes) &&
             nueva.imagenes.length > (actual.imagenes?.length || 0)
                 ? nueva.imagenes
                 : actual.imagenes,
-
-        video_url:
-            nueva.video_url ||
-            actual.video_url,
-
+        video_url: actual.video_url || nueva.video_url,
         ubicacion: {
-            ...actual.ubicacion,
-            ...nueva.ubicacion
+            ...nueva.ubicacion,
+            ...actual.ubicacion
         },
-
         detalles: {
-            ...actual.detalles,
-            ...nueva.detalles
+            ...nueva.detalles,
+            ...actual.detalles
         }
     };
 };
@@ -1186,10 +1000,7 @@ const combinarResultadosCatalogo = (results) => {
 
             propiedadesPorId.set(
                 key,
-                combinarPropiedadOperacion(
-                    propiedadesPorId.get(key),
-                    item
-                )
+                combinarPropiedadOperacion(propiedadesPorId.get(key), item)
             );
         }
     }
@@ -1235,20 +1046,18 @@ const combinarResultadosCatalogo = (results) => {
     };
 };
 
-// La API de Alaluf requiere obj.
-// Cuando el frontend no informa una operación se utiliza obj=3,
-// que corresponde a Venta o Arriendo.
+// La API de Alaluf no acepta búsquedas por tipo sin obj. Cuando el frontend
+// no especifica operación, se descargan/leen en paralelo los snapshots de
+// venta y arriendo, ambos cacheados, y luego se combinan en memoria.
 const descargarCatalogosPorObjetivo = async (
     catalogQuery,
     obj,
     options = {}
 ) => {
-    const objetivoNormalizado =
-        normalizarObjetivo(obj) || '3';
-
-    const objetivos = [
-        objetivoNormalizado
-    ];
+    const objetivoNormalizado = normalizarObjetivo(obj);
+    const objetivos = objetivoNormalizado
+        ? [objetivoNormalizado]
+        : ['1', '2'];
 
     const settled = await Promise.allSettled(
         objetivos.map(async (objetivo) => {
@@ -1264,10 +1073,7 @@ const descargarCatalogosPorObjetivo = async (
 
             return {
                 ...result,
-                cacheKey: crearCacheKey(
-                    `catalog:${CATALOG_CACHE_SCHEMA}`,
-                    queryPorObjetivo
-                ),
+                cacheKey: crearCacheKey('catalog', queryPorObjetivo),
                 objetivo
             };
         })
@@ -1290,7 +1096,7 @@ const descargarCatalogosPorObjetivo = async (
 
     if (fulfilled.length === 0) {
         throw rejected[0]?.reason || new Error(
-            'No fue posible cargar el catálogo solicitado.'
+            'No fue posible cargar el catálogo de venta ni arriendo.'
         );
     }
 
@@ -1380,125 +1186,32 @@ const filtrarPorOperacionYPrecio = (
     propiedades,
     { obj, precioMin, precioMax, moneda }
 ) => {
-    const objetivo = normalizarObjetivo(obj);
-    const tieneRango =
-        Number.isFinite(precioMin) ||
-        Number.isFinite(precioMax);
+    const tieneRango = Number.isFinite(precioMin) || Number.isFinite(precioMax);
 
     return propiedades.filter((item) => {
-        const descObj =
-            item.desc_obj ||
-            item.operacion;
-
-        /*
-         * desc_obj define si la propiedad pertenece a Venta o Arriendo.
-         * La existencia de un precio no puede cambiar su operación.
-         */
-        if (
-            objetivo &&
-            !operacionCoincide(descObj, objetivo)
-        ) {
-            return false;
-        }
-
         const venta = item.precios?.venta;
         const arriendo = item.precios?.arriendo;
 
-        const permiteVenta =
-            operacionCoincide(descObj, '1');
-
-        const permiteArriendo =
-            operacionCoincide(descObj, '2');
-
-        if (objetivo === '1') {
-            if (!tieneRango && !moneda) {
-                return true;
-            }
-
-            return (
-                permiteVenta &&
-                precioCumpleRango(
-                    venta,
-                    moneda,
-                    precioMin,
-                    precioMax
-                )
-            );
+        if (obj === '1') {
+            return tieneRango
+                ? precioCumpleRango(venta, moneda, precioMin, precioMax)
+                : Number.parseFloat(venta?.valor || 0) > 0;
         }
 
-        if (objetivo === '2') {
-            if (!tieneRango && !moneda) {
-                return true;
-            }
-
-            return (
-                permiteArriendo &&
-                precioCumpleRango(
-                    arriendo,
-                    moneda,
-                    precioMin,
-                    precioMax
-                )
-            );
-        }
-
-        if (objetivo === '3') {
-            if (!tieneRango && !moneda) {
-                return (
-                    permiteVenta ||
-                    permiteArriendo
-                );
-            }
-
-            return (
-                (
-                    permiteVenta &&
-                    precioCumpleRango(
-                        venta,
-                        moneda,
-                        precioMin,
-                        precioMax
-                    )
-                ) ||
-                (
-                    permiteArriendo &&
-                    precioCumpleRango(
-                        arriendo,
-                        moneda,
-                        precioMin,
-                        precioMax
-                    )
-                )
-            );
+        if (obj === '2') {
+            return tieneRango
+                ? precioCumpleRango(arriendo, moneda, precioMin, precioMax)
+                : Number.parseFloat(arriendo?.valor || 0) > 0;
         }
 
         if (tieneRango || moneda) {
             return (
-                (
-                    permiteVenta &&
-                    precioCumpleRango(
-                        venta,
-                        moneda,
-                        precioMin,
-                        precioMax
-                    )
-                ) ||
-                (
-                    permiteArriendo &&
-                    precioCumpleRango(
-                        arriendo,
-                        moneda,
-                        precioMin,
-                        precioMax
-                    )
-                )
+                precioCumpleRango(venta, moneda, precioMin, precioMax) ||
+                precioCumpleRango(arriendo, moneda, precioMin, precioMax)
             );
         }
 
-        return (
-            permiteVenta ||
-            permiteArriendo
-        );
+        return true;
     });
 };
 
@@ -1567,9 +1280,8 @@ router.get('/buscar', async (req, res) => {
         const processingStartedAt = performance.now();
         let propiedades = [...searchResult.items];
 
-        // desc_obj es el campo mandante para operación. Precio y moneda se
-        // aplican después, sin permitir que un valor antiguo cambie Venta por
-        // Arriendo o viceversa.
+        // Operación, precio y moneda se filtran en memoria sobre el snapshot
+        // base para evitar reconstruir catálogos equivalentes.
         propiedades = filtrarPorOperacionYPrecio(propiedades, {
             obj,
             precioMin,
@@ -1635,12 +1347,6 @@ router.get('/buscar', async (req, res) => {
             totalMs: Math.round(totalMs),
             catalogo: searchResult.items.length,
             totalFiltrado: totalPropiedades,
-            objetivo: obj === '1'
-                ? 'VENTA'
-                : obj === '2'
-                    ? 'ARRIENDO'
-                    : 'VENTA O ARRIENDO',
-            campoMandante: 'desc_obj',
             comuna: comunaNombre || comunaCodigo || 'GENERAL',
             entregadas: resultados.length,
             pagina: paginaNormalizada,
@@ -1667,13 +1373,6 @@ router.get('/buscar', async (req, res) => {
                 tiempoTotalMs: Math.round(totalMs),
                 catalogoDescargado: searchResult.items.length,
                 filtroComuna: comunaNombre || comunaCodigo || null,
-                objetivo:
-                    obj === '1'
-                        ? 'Venta'
-                        : obj === '2'
-                            ? 'Arriendo'
-                            : 'Venta o Arriendo',
-                campoOperacionMandante: 'desc_obj',
                 peticionesApi: searchResult.peticionesApi || 0,
                 catalogoCompleto: searchResult.catalogoCompleto !== false,
                 cacheStale: Boolean(searchResult.stale),
@@ -1981,9 +1680,7 @@ router.post('/cache/refresh', verificarAdminCache, async (req, res) => {
 
             return res.json({
                 success: true,
-                refreshed: 1,
-                objetivo:
-                    normalizarObjetivo(obj) || '3',
+                refreshed: obj ? 1 : 2,
                 catalogKeys: result.catalogKeys,
                 items: result.items.length,
                 updatedAt: new Date(result.updatedAt).toISOString()
