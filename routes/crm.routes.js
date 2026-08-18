@@ -4,10 +4,8 @@ const axios = require('axios');
 
 router.post('/webhook/crm', async (req, res) => {
   try {
-    // 1. Extraemos los datos que nos envía el frontend (React)
-    const { nombre, rut, email, telefono, mensaje, origen } = req.body;
+        const { nombre, rut, email, telefono, mensaje, origen } = req.body;
 
-    // 2. Validación básica de seguridad en el backend
     if (!nombre || !rut || !email) {
       return res.status(400).json({ 
         success: false, 
@@ -15,8 +13,7 @@ router.post('/webhook/crm', async (req, res) => {
       });
     }
 
-    // 3. Preparamos el paquete de datos (Payload) para el CRM en PHP
-    const payload = {
+      const payload = {
       nombre,
       rut,
       email,
@@ -26,7 +23,7 @@ router.post('/webhook/crm', async (req, res) => {
       origen: origen || "Formulario Web (Desconocido)" 
     };
 
-    // 4. Hacemos la petición POST al CRM del cliente
+    
     const response = await axios.post(process.env.CRM_PHP_URL, payload, {
       headers: {
         'Content-Type': 'application/json',
@@ -35,16 +32,14 @@ router.post('/webhook/crm', async (req, res) => {
       }
     });
 
-    // 5. Respondemos a React que todo fue un éxito
-    res.status(200).json({ 
+      res.status(200).json({ 
       success: true, 
       message: "Lead derivado exitosamente al CRM",
       crm_response: response.data 
     });
 
   } catch (error) {
-    // Si el servidor PHP falla, está caído o rechaza el token, lo capturamos aquí
-    console.error("Error al enviar lead al CRM:", error.response?.data || error.message);
+      console.error("Error al enviar lead al CRM:", error.response?.data || error.message);
     
     res.status(500).json({ 
       success: false, 

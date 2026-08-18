@@ -5,9 +5,6 @@ const https = require('node:https');
 const NodeCache = require('node-cache');
 const { performance } = require('node:perf_hooks');
 
-// Configuración de caché ajustable por variables de entorno.
-// La frescura lógica es corta, pero el dato anterior se conserva como respaldo
-// para responder sin demoras mientras se reconstruye el catálogo.
 const CATALOG_FRESH_MS = Number(process.env.CATALOG_FRESH_MS || 60_000);
 const CATALOG_CACHE_TTL_SECONDS = Number(
     process.env.CATALOG_CACHE_TTL_SECONDS || 21_600
@@ -44,15 +41,12 @@ const detailCache = new NodeCache({
     useClones: false
 });
 
-// Evita descargas duplicadas para la misma búsqueda o detalle.
+
 const pendingSearches = new Map();
 const pendingDetails = new Map();
 
-// Registra qué catálogos se consultaron recientemente para refrescar solo
-// los que realmente están siendo utilizados.
 const activeCatalogs = new Map();
 
-// Suscriptores SSE opcionales para avisar al frontend cuando un catálogo cambia.
 const cacheEventSubscribers = new Set();
 
 const keepAliveAgent = new https.Agent({
@@ -241,16 +235,10 @@ const COMUNAS_POR_CODIGO = Object.freeze({
     '16103': 'San Francisco de Mostazal',
 });
 
-// La API soporta limit/offset. Usamos páginas internas más grandes para reducir
-// la cantidad de viajes a PHP, pero al frontend solo se le entregan 10/20 ítems.
-// La API de Alaluf actualmente limita la respuesta real a cerca de 20
-// elementos aunque se solicite un límite mayor. Se solicita 1000 primero
-// por si el proveedor habilita nuevamente respuestas grandes.
+
 const CATALOG_PAGE_SIZE = 1000;
 
-// Con 531 propiedades y páginas reales de 20 registros se requieren unas
-// 27 llamadas. Ejecutar 7 en paralelo reduce el proceso a aproximadamente
-// cinco rondas, en vez de las catorce rondas que producía BATCH_SIZE = 2.
+
 const BATCH_SIZE = 7;
 const MAX_OFFSET = 10000;
 
@@ -260,8 +248,7 @@ const limpiarValor = (value) => {
     return normalized === 'undefined' || normalized === 'null' ? '' : normalized;
 };
 
-// Normaliza el campo de video recibido desde la API de Alaluf.
-// Soporta URL completa, ruta relativa, iframe, objetos y arreglos.
+
 const resolverUrlMultimedia = (value) => {
     if (value === undefined || value === null || value === '') {
         return null;
@@ -299,7 +286,7 @@ const resolverUrlMultimedia = (value) => {
     let raw = limpiarValor(value);
     if (!raw) return null;
 
-    // Algunos proveedores entregan el reproductor como iframe HTML.
+    
     const iframeMatch = raw.match(
         /<iframe[^>]+src=["']([^"']+)["']/i
     );
@@ -308,7 +295,7 @@ const resolverUrlMultimedia = (value) => {
         raw = iframeMatch[1].trim();
     }
 
-    // También acepta un JSON serializado con la URL del video.
+   
     if (
         (raw.startsWith('{') && raw.endsWith('}')) ||
         (raw.startsWith('[') && raw.endsWith(']'))
@@ -317,22 +304,21 @@ const resolverUrlMultimedia = (value) => {
             const parsed = JSON.parse(raw);
             return resolverUrlMultimedia(parsed);
         } catch {
-            // Si no es JSON válido, continúa procesándolo como texto.
+           
         }
     }
 
-    // URL protocol-relative: //www.youtube.com/...
+    
     if (raw.startsWith('//')) {
         return `https:${raw}`;
     }
 
-    // URL absoluta: YouTube, Vimeo, MP4, WebM u otro proveedor.
+    
     if (/^https?:\/\//i.test(raw)) {
         return raw;
     }
 
-    // Algunos registros entregan el ID de YouTube acompañado del proveedor.
-    // Ejemplo: K11cNaArmkI;youtube
+    
     const youtubeConProveedor = raw.match(
         /^([a-zA-Z0-9_-]{11})\s*;\s*youtube$/i
     );
@@ -341,13 +327,12 @@ const resolverUrlMultimedia = (value) => {
         return `https://youtu.be/${youtubeConProveedor[1]}`;
     }
 
-    // Algunos registros entregan solamente el ID de YouTube.
-    // Ejemplo: F78GcjP8chM
+    
     if (/^[a-zA-Z0-9_-]{11}$/.test(raw)) {
         return `https://youtu.be/${raw}`;
     }
 
-    // También soporta enlaces de YouTube o Vimeo sin protocolo.
+    
     if (
         /^(?:www\.)?(?:youtube\.com|youtu\.be|vimeo\.com|player\.vimeo\.com)\//i.test(raw)
     ) {
@@ -361,7 +346,7 @@ const resolverUrlMultimedia = (value) => {
         return `${SISTEMA_URL_ALALUF}/nuevo/uploads/${cleanPath}`;
     }
 
-    // Rutas relativas pertenecientes al sistema de Alaluf.
+    
     if (
         cleanPath.startsWith('nuevo/') ||
         cleanPath.startsWith('uploads/')
@@ -391,9 +376,6 @@ const parsePositiveInt = (value, fallback, max = Number.MAX_SAFE_INTEGER) => {
     return Math.min(parsed, max);
 };
 
-// La API externa exige obj=1 (venta) u obj=2 (arriendo) cuando se consulta
-// por tipo de propiedad. También normaliza valores textuales recibidos desde
-// el frontend para impedir que un valor no válido llegue al CRM.
 const normalizarObjetivo = (value) => {
     const raw = limpiarValor(value).toLowerCase();
 
@@ -659,12 +641,7 @@ const obtenerConsulta = (query) => {
     const moneda = normalizarMoneda(query.moneda);
     const destaq = limpiarValor(query.destaq);
 
-    // El CRM de Alaluf necesita la combinación tipo_prop + obj + comuna
-    // para devolver el conjunto correcto. Por eso la comuna forma parte del
-    // snapshot cuando viene informada. Precio, superficie, orden y paginación
-    // continúan procesándose localmente para mantener las búsquedas rápidas.
-    // La operación se agrega al solicitar el snapshot porque la API exige
-    // obj=1 (venta) u obj=2 (arriendo).
+   
     const catalogQuery = {
         tipo_prop: tipoProp
     };
@@ -806,8 +783,6 @@ const construirCatalogo = async (catalogQuery, cacheKey) => {
     }
 
     const result = {
-        // Se mapea una sola vez al construir el snapshot para que cada búsqueda
-        // posterior solo filtre, ordene y pagine en memoria.
         items: catalogo.map(mapearPropiedad),
         rawItemsCount: catalogo.length,
         apiMs: performance.now() - apiStartedAt,
@@ -816,8 +791,7 @@ const construirCatalogo = async (catalogQuery, cacheKey) => {
         updatedAt: Date.now()
     };
 
-    // Solo se promociona a caché fresca cuando el catálogo terminó de forma
-    // correcta. El respaldo conserva el último catálogo utilizable.
+    
     if (catalogoCompleto) {
         searchCache.set(cacheKey, result);
         staleSearchCache.set(cacheKey, result);
@@ -1046,9 +1020,7 @@ const combinarResultadosCatalogo = (results) => {
     };
 };
 
-// La API de Alaluf no acepta búsquedas por tipo sin obj. Cuando el frontend
-// no especifica operación, se descargan/leen en paralelo los snapshots de
-// venta y arriendo, ambos cacheados, y luego se combinan en memoria.
+
 const descargarCatalogosPorObjetivo = async (
     catalogQuery,
     obj,
@@ -1143,8 +1115,7 @@ const refrescarCatalogosActivos = async ({ force = false } = {}) => {
 
         if (!needsRefresh || pendingSearches.has(cacheKey)) continue;
 
-        // Se ejecuta secuencialmente para evitar golpear al CRM con varias
-        // categorías completas al mismo tiempo.
+       
         jobs.push(async () => {
             try {
                 await iniciarActualizacionCatalogo(
@@ -1173,7 +1144,7 @@ const refreshTimer = setInterval(() => {
     });
 }, CACHE_REFRESH_SCAN_MS);
 
-// Permite que Node finalice normalmente durante pruebas o despliegues.
+
 refreshTimer.unref?.();
 
 const obtenerPrecioComparable = (item) => {
@@ -1236,7 +1207,7 @@ const ordenarPropiedades = (propiedades, orden, dir) => {
         return;
     }
 
-    // Comportamiento por defecto: propiedades más nuevas primero.
+    
     propiedades.sort((a, b) => {
         const idA = Number.parseInt(a.id, 10) || 0;
         const idB = Number.parseInt(b.id, 10) || 0;
@@ -1244,7 +1215,7 @@ const ordenarPropiedades = (propiedades, orden, dir) => {
     });
 };
 
-// Búsqueda paginada con catálogo completo en caché.
+
 router.get('/buscar', async (req, res) => {
     const totalStartedAt = performance.now();
 
@@ -1280,8 +1251,7 @@ router.get('/buscar', async (req, res) => {
         const processingStartedAt = performance.now();
         let propiedades = [...searchResult.items];
 
-        // Operación, precio y moneda se filtran en memoria sobre el snapshot
-        // base para evitar reconstruir catálogos equivalentes.
+        
         propiedades = filtrarPorOperacionYPrecio(propiedades, {
             obj,
             precioMin,
@@ -1289,9 +1259,7 @@ router.get('/buscar', async (req, res) => {
             moneda
         });
 
-        // La API externa puede ignorar el filtro comuna. Por eso se aplica
-        // nuevamente en Node sobre el catálogo base, usando primero el código
-        // disponible y, como respaldo, el nombre normalizado de la comuna.
+        
         if (comunaCodigo || comunaNombre) {
             const comunaNombreNormalizada = normalizarTexto(comunaNombre);
 
@@ -1313,8 +1281,7 @@ router.get('/buscar', async (req, res) => {
             });
         }
 
-        // Al tener el catálogo completo, el filtro de superficie y su total
-        // quedan correctamente calculados.
+        
         if (Number.isFinite(supDesde)) {
             propiedades = propiedades.filter(
                 (item) => item.detalles.superficie >= supDesde
@@ -1589,8 +1556,6 @@ const verificarAdminCache = (req, res, next) => {
     return next();
 };
 
-// Eventos ligeros para que el frontend pueda enterarse de refrescos sin usar
-// Socket.IO. Se puede consumir con EventSource desde el navegador.
 router.get('/cache/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1713,7 +1678,7 @@ router.post('/cache/clear', verificarAdminCache, (req, res) => {
     });
 });
 
-// Búsqueda por código comercial.
+
 router.get('/codigo/:codigo', async (req, res) => {
     const codigo = limpiarValor(req.params.codigo);
     const totalStartedAt = performance.now();
@@ -1787,7 +1752,7 @@ router.get('/codigo/:codigo', async (req, res) => {
     }
 });
 
-// Ruta individual por ID interno. Debe ir al final.
+
 router.get('/:id', async (req, res) => {
     const id = limpiarValor(req.params.id);
 
